@@ -4,20 +4,25 @@ Serverless image processing pipeline using AWS services (S3, SQS, DynamoDB, and 
 
 ## Architecture
 
-The pipeline consists of 4 Lambda functions:
+The pipeline consists of:
 
-1. **Lambda1 (Get Upload URL)** - Generates presigned S3 upload URL
-2. **Lambda2 (Process Upload)** - Triggered by S3 event, creates DynamoDB record and sends SQS message
-3. **Lambda3 (Resize Image)** - Triggered by SQS, resizes image to 400x400 and updates DynamoDB
-4. **Lambda4 (Get Status)** - Returns processing status and download URL if ready
+- **API Gateway HTTP API** - REST endpoints for upload and status
+- **4 Lambda Functions**:
+  1. **GetUploadUrl** - Generates presigned S3 upload URL (300s TTL)
+  2. **ProcessUpload** - Triggered by S3 event, creates DynamoDB record and sends SQS message
+  3. **ResizeImage** - Triggered by SQS, resizes image to 400x400 using Sharp
+  4. **GetStatus** - Returns processing status and download URL (600s TTL)
+- **Frontend** - Web interface with drag & drop upload
 
 ## AWS Resources
 
-- **S3 Bucket 1 (Upload)**: Private bucket for original images
-- **S3 Bucket 2 (Processed)**: Private bucket for resized images
+- **API Gateway HTTP API**: REST endpoints (`/upload`, `/status`)
+- **S3 Bucket (Upload)**: Private bucket for original images with encryption
+- **S3 Bucket (Processed)**: Private bucket for resized images with encryption
 - **DynamoDB Table**: Stores image metadata and processing status
-- **SQS Queue**: Triggers Lambda3 for image processing
-- **4 Lambda Functions**: Handle the processing pipeline
+- **SQS Queue**: Async trigger for image processing
+- **4 Lambda Functions**: Node.js 20.x with automatic bundling
+- **CloudWatch Logs**: All Lambda execution logs
 
 ## Prerequisites
 
@@ -39,17 +44,25 @@ cd lambdas-image
 npm install
 ```
 
-3. Install Lambda dependencies:
+3. Create IAM User (required for CDK):
+   - AWS Console → IAM → Users → Create user
+   - Username: `cdk-deploy-user`
+   - Attach policy: `AdministratorAccess`
+   - Create access key for CLI
+
+4. Configure AWS CLI:
 ```bash
-cd lambdas/lambda1-get-upload-url && npm install && cd ../..
-cd lambdas/lambda2-process-upload && npm install && cd ../..
-cd lambdas/lambda3-resize-image && npm install && cd ../..
-cd lambdas/lambda4-get-status && npm install && cd ../..
+aws configure --profile cdk
+# Enter your IAM user credentials
+# Region: eu-north-1
+# Output: json
+
+export AWS_PROFILE=cdk
 ```
 
-4. Bootstrap CDK (first time only):
+5. Bootstrap CDK (first time only):
 ```bash
-cdk bootstrap
+cdk bootstrap aws://YOUR_ACCOUNT_ID/eu-north-1
 ```
 
 ## Deployment
@@ -73,17 +86,25 @@ npm run deploy
 
 ## Usage
 
-### 1. Get Upload URL
-
-Invoke Lambda1 to get a presigned upload URL:
+### Option 1: Web Interface (Recommended)
 
 ```bash
-aws lambda invoke \
-  --function-name ImageProcessing-GetUploadUrl \
-  --payload '{}' \
-  response.json
+npm start
+# Opens http://localhost:3000
+# 1. Select or drag & drop an image
+# 2. Click "Upload and Process"
+# 3. Wait ~10 seconds
+# 4. View processed 400x400 image
+```
 
-cat response.json
+### Option 2: API Endpoints
+
+#### 1. Get Upload URL
+
+```bash
+curl -X POST https://YOUR_API_ID.execute-api.eu-north-1.amazonaws.com/upload \
+  -H "Content-Type: application/json" \
+  -d '{}'
 ```
 
 Response:
@@ -107,17 +128,10 @@ curl -X PUT \
   "<uploadUrl>"
 ```
 
-### 3. Check Status
-
-Check processing status using Lambda4:
+#### 3. Check Status
 
 ```bash
-aws lambda invoke \
-  --function-name ImageProcessing-GetStatus \
-  --payload '{"queryStringParameters":{"imageId":"<your-image-id>"}}' \
-  status.json
-
-cat status.json
+curl "https://YOUR_API_ID.execute-api.eu-north-1.amazonaws.com/status?imageId=<your-image-id>"
 ```
 
 Response (pending):
@@ -151,25 +165,32 @@ curl "<downloadUrl>" -o processed-image.jpg
 
 ## Testing
 
-You can test the entire pipeline with a sample image:
+### Test Script
+
+```bash
+# Set your API endpoint
+export API_ENDPOINT=https://YOUR_API_ID.execute-api.eu-north-1.amazonaws.com
+
+# Run test
+./scripts/test-pipeline.sh path/to/image.jpg
+```
+
+### Manual Testing
 
 ```bash
 # 1. Get upload URL
-RESPONSE=$(aws lambda invoke --function-name ImageProcessing-GetUploadUrl --payload '{}' /dev/stdout | tail -1)
+RESPONSE=$(curl -s -X POST $API_ENDPOINT/upload -H "Content-Type: application/json" -d '{}')
 UPLOAD_URL=$(echo $RESPONSE | jq -r '.uploadUrl')
 IMAGE_ID=$(echo $RESPONSE | jq -r '.imageId')
 
 # 2. Upload image
 curl -X PUT -H "Content-Type: image/jpeg" --data-binary @test-image.jpg "$UPLOAD_URL"
 
-# 3. Wait a few seconds for processing
+# 3. Wait for processing
 sleep 10
 
-# 4. Check status and get download URL
-aws lambda invoke \
-  --function-name ImageProcessing-GetStatus \
-  --payload "{\"queryStringParameters\":{\"imageId\":\"$IMAGE_ID\"}}" \
-  /dev/stdout | tail -1 | jq
+# 4. Check status
+curl "$API_ENDPOINT/status?imageId=$IMAGE_ID" | jq
 ```
 
 ## DynamoDB Schema
@@ -200,22 +221,30 @@ npm run destroy
 ## Project Structure
 
 ```
-.
+lambda-images/
 ├── bin/
 │   └── app.ts                    # CDK app entry point
 ├── lib/
-│   └── image-processing-stack.ts # CDK stack definition
+│   └── image-processing-stack.ts # CDK stack (all infrastructure)
 ├── lambdas/
-│   ├── lambda1-get-upload-url/   # Get presigned upload URL
-│   ├── lambda2-process-upload/   # Process S3 events
-│   ├── lambda3-resize-image/     # Resize images
-│   └── lambda4-get-status/       # Get processing status
+│   ├── get-upload-url.ts         # Lambda 1: Generate presigned URL
+│   ├── process-upload.ts         # Lambda 2: S3 event handler
+│   ├── resize-image.ts           # Lambda 3: Image processing (Sharp)
+│   └── get-status.ts             # Lambda 4: Status checker
+├── public/
+│   └── index.html                # Frontend web interface
 ├── diagrams/
-│   └── architecture.png          # Architecture diagram
+│   └── architecture-mermaid.md   # Mermaid architecture diagrams
+├── scripts/
+│   └── test-pipeline.sh          # Testing script
+├── types/
+│   └── image-record.ts           # TypeScript types
 ├── package.json
 ├── tsconfig.json
 ├── cdk.json
-└── README.md
+├── DEPLOYMENT.md                 # Deployment guide
+├── CONTRIBUTING.md               # Contribution guidelines
+└── README.md                     # This file
 ```
 
 ## Technology Stack

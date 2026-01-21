@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="uk">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Image Processing Pipeline</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    const API_ENDPOINT = 'https://6hrossef74.execute-api.eu-north-1.amazonaws.com';
+  </script>
+</head>
+
+<body class="bg-gray-50 min-h-screen">
+  <div class="container mx-auto px-4 py-8 max-w-4xl">
+    <div class="bg-white rounded-lg shadow-lg p-8">
+      <h1 class="text-3xl font-bold text-gray-800 mb-2">🖼️ Image Processing Pipeline</h1>
+      <p class="text-gray-600 mb-8">Завантажте зображення для автоматичної обробки (resize 400x400)</p>
+
+      <div class="mb-8">
+        <label class="block text-lg font-semibold text-gray-800 mb-4">📤 Завантажити зображення</label>
+        <div
+          class="border-2 border-dashed border-gray-300 rounded-lg p-8 text-center hover:border-blue-500 transition-colors"
+          id="dropZone">
+          <input type="file" id="fileInput" accept="image/*" class="hidden">
+          <button onclick="document.getElementById('fileInput').click()"
+            class="bg-blue-600 hover:bg-blue-700 text-white font-semibold py-3 px-6 rounded-lg transition-colors">
+            Обрати файл
+          </button>
+          <p class="text-gray-500 mt-4 text-sm">або перетягніть файл сюди</p>
+          <p id="fileName" class="text-gray-700 mt-2 font-medium"></p>
+        </div>
+      </div>
+
+      <div id="previewSection" class="mb-8 hidden">
+        <h3 class="text-lg font-semibold text-gray-800 mb-4">🔍 Попередній перегляд</h3>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div>
+            <p class="text-sm font-medium text-gray-700 mb-2">Оригінал</p>
+            <img id="originalPreview" class="w-full rounded-lg border border-gray-300">
+          </div>
+          <div id="processedPreviewContainer" class="hidden">
+            <p class="text-sm font-medium text-gray-700 mb-2">Оброблене (400x400)</p>
+            <img id="processedPreview" class="w-full rounded-lg border border-gray-300">
+          </div>
+        </div>
+      </div>
+
+      <div id="statusSection" class="mb-8 hidden">
+        <div class="bg-gray-50 rounded-lg p-6">
+          <h3 class="text-lg font-semibold text-gray-800 mb-4">📊 Статус обробки</h3>
+          <div class="space-y-3">
+            <div class="flex items-center justify-between">
+              <span class="text-gray-700">Image ID:</span>
+              <code id="imageId" class="bg-gray-200 px-3 py-1 rounded text-sm"></code>
+            </div>
+            <div class="flex items-center justify-between">
+              <span class="text-gray-700">Статус:</span>
+              <span id="status" class="px-3 py-1 rounded text-sm font-semibold"></span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="mb-8">
+        <h3 class="text-lg font-semibold text-gray-800 mb-4">📝 Лог подій</h3>
+        <div id="log" class="bg-gray-900 text-green-400 rounded-lg p-4 font-mono text-sm h-64 overflow-y-auto">
+          <div class="text-gray-500">Очікування дій...</div>
+        </div>
+      </div>
+
+      <div class="flex gap-4">
+        <button id="uploadBtn" disabled
+          class="flex-1 bg-green-600 hover:bg-green-700 disabled:bg-gray-400 disabled:cursor-not-allowed text-white font-semibold py-3 px-6 rounded-lg transition-colors">
+          🚀 Завантажити та обробити
+        </button>
+        <button id="checkStatusBtn" disabled
+          class="bg-blue-600 hover:bg-blue-700 disabled:bg-gray-400 disabled:cursor-not-allowed text-white font-semibold py-3 px-6 rounded-lg transition-colors">
+          🔄 Перевірити статус
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let selectedFile = null;
+    let currentImageId = null;
+    const fileInput = document.getElementById('fileInput');
+    const uploadBtn = document.getElementById('uploadBtn');
+    const checkStatusBtn = document.getElementById('checkStatusBtn');
+    const logDiv = document.getElementById('log');
+
+    fileInput.addEventListener('change', (e) => {
+      selectedFile = e.target.files[0];
+      if (selectedFile) {
+        document.getElementById('fileName').textContent = `Обрано: ${selectedFile.name}`;
+        uploadBtn.disabled = false;
+        const reader = new FileReader();
+        reader.onload = (e) => {
+          document.getElementById('originalPreview').src = e.target.result;
+          document.getElementById('previewSection').classList.remove('hidden');
+        };
+        reader.readAsDataURL(selectedFile);
+        addLog(`✅ Файл обрано: ${selectedFile.name} (${(selectedFile.size / 1024).toFixed(2)} KB)`);
+      }
+    });
+
+    const dropZone = document.getElementById('dropZone');
+    dropZone.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      dropZone.classList.add('border-blue-500', 'bg-blue-50');
+    });
+    dropZone.addEventListener('dragleave', () => {
+      dropZone.classList.remove('border-blue-500', 'bg-blue-50');
+    });
+    dropZone.addEventListener('drop', (e) => {
+      e.preventDefault();
+      dropZone.classList.remove('border-blue-500', 'bg-blue-50');
+      const file = e.dataTransfer.files[0];
+      if (file && file.type.startsWith('image/')) {
+        fileInput.files = e.dataTransfer.files;
+        fileInput.dispatchEvent(new Event('change'));
+      }
+    });
+
+    uploadBtn.addEventListener('click', async () => {
+      if (!selectedFile) return;
+      try {
+        uploadBtn.disabled = true;
+        document.getElementById('statusSection').classList.remove('hidden');
+        addLog('🔄 Виклик API Gateway /upload...');
+        const response = await fetch(`${API_ENDPOINT}/upload`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({})
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.json();
+        currentImageId = data.imageId;
+        document.getElementById('imageId').textContent = currentImageId;
+        addLog(`✅ Upload URL отримано (ID: ${currentImageId})`);
+        addLog(`📤 Завантаження ${selectedFile.name} в S3...`);
+        const uploadResponse = await fetch(data.uploadUrl, {
+          method: 'PUT',
+          body: selectedFile,
+          headers: { 'Content-Type': selectedFile.type }
+        });
+        if (!uploadResponse.ok) throw new Error('Помилка завантаження в S3');
+        addLog('✅ Файл завантажено в S3');
+        updateStatus('pending', '⏳ Обробка...');
+        addLog('⏳ Очікування обробки...');
+        checkStatusBtn.disabled = false;
+        setTimeout(() => checkStatus(), 3000);
+      } catch (error) {
+        addLog(`❌ Помилка: ${error.message}`, 'error');
+        uploadBtn.disabled = false;
+        updateStatus('error', '❌ Помилка');
+      }
+    });
+
+    checkStatusBtn.addEventListener('click', () => checkStatus());
+
+    async function checkStatus() {
+      if (!currentImageId) return;
+      try {
+        addLog('🔍 Перевірка статусу...');
+        const response = await fetch(`${API_ENDPOINT}/status?imageId=${currentImageId}`);
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.json();
+        if (data.status === 'ok') {
+          addLog('✅ Обробка завершена!');
+          updateStatus('ok', '✅ Готово');
+          if (data.downloadUrl) {
+            addLog('📥 Завантаження обробленого зображення...');
+            document.getElementById('processedPreview').src = data.downloadUrl;
+            document.getElementById('processedPreviewContainer').classList.remove('hidden');
+            addLog('✅ Оброблене зображення завантажено');
+          }
+          uploadBtn.disabled = false;
+        } else if (data.status === 'pending') {
+          addLog('⏳ Обробка ще триває...');
+          updateStatus('pending', '⏳ Обробка...');
+          setTimeout(() => checkStatus(), 2000);
+        } else {
+          addLog(`❌ Статус: ${data.status}`, 'error');
+          updateStatus('error', '❌ Помилка');
+        }
+      } catch (error) {
+        addLog(`❌ Помилка: ${error.message}`, 'error');
+      }
+    }
+
+    function addLog(message, type = 'info') {
+      const logEntry = document.createElement('div');
+      logEntry.className = 'mb-1';
+      const timestamp = new Date().toLocaleTimeString('uk-UA');
+      const colors = { info: 'text-green-400', warning: 'text-yellow-400', error: 'text-red-400' };
+      logEntry.innerHTML = `<span class="text-gray-500">[${timestamp}]</span> <span class="${colors[type]}">${message}</span>`;
+      if (logDiv.querySelector('.text-gray-500:only-child')) logDiv.innerHTML = '';
+      logDiv.appendChild(logEntry);
+      logDiv.scrollTop = logDiv.scrollHeight;
+    }
+
+    function updateStatus(status, text) {
+      const statusEl = document.getElementById('status');
+      statusEl.textContent = text;
+      const classes = { pending: 'bg-yellow-100 text-yellow-800', ok: 'bg-green-100 text-green-800', error: 'bg-red-100 text-red-800' };
+      statusEl.className = `px-3 py-1 rounded text-sm font-semibold ${classes[status]}`;
+    }
+
+    addLog('🚀 Image Processing Pipeline готовий');
+    addLog('✅ Lambda Function URLs налаштовані');
+  </script>
+</body>
+
+</html>

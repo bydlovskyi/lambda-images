@@ -1,0 +1,14 @@
+*.js
+!jest.config.js
+*.d.ts
+node_modules
+dist
+
+*.swp
+package-lock.json
+.cdk.staging
+.cdk.out
+cdk.out
+
+.DS_Store
+.env

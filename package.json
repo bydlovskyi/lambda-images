@@ -1,0 +1,35 @@
+{
+  "name": "image-processing-pipeline",
+  "version": "1.0.0",
+  "description": "AWS Serverless Image Processing Pipeline",
+  "main": "index.js",
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc -w",
+    "cdk": "cdk",
+    "deploy": "cdk deploy",
+    "destroy": "cdk destroy",
+    "synth": "cdk synth",
+    "diff": "cdk diff",
+    "start": "npx http-server public -p 3000 -o"
+  },
+  "keywords": ["aws", "cdk", "lambda", "s3", "sqs", "dynamodb"],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.145",
+    "@types/node": "^20.11.0",
+    "aws-cdk": "^2.120.0",
+    "typescript": "^5.3.3"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.490.0",
+    "@aws-sdk/client-s3": "^3.490.0",
+    "@aws-sdk/client-sqs": "^3.490.0",
+    "@aws-sdk/lib-dynamodb": "^3.490.0",
+    "@aws-sdk/s3-request-presigner": "^3.490.0",
+    "aws-cdk-lib": "^2.120.0",
+    "constructs": "^10.3.0",
+    "sharp": "^0.33.1"
+  }
+}
