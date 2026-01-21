@@ -26,63 +26,263 @@ The pipeline consists of:
 
 ## Prerequisites
 
-- AWS Account with configured credentials
-- Node.js 18+ and npm
-- AWS CDK CLI: `npm install -g aws-cdk`
-- AWS CLI configured with appropriate permissions
+- **AWS Account** - [Create one here](https://aws.amazon.com/)
+- **Node.js 18+** and npm - [Download here](https://nodejs.org/)
+- **AWS CDK CLI** - Will be installed in step 2
+- **AWS CLI** - [Install guide](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html)
+- **Git** - For cloning the repository
 
-## Installation
+## 🚀 Getting Started from Scratch
 
-1. Clone the repository:
+Follow these steps to deploy the entire pipeline from scratch:
+
+### Step 1: Clone the Repository
+
 ```bash
 git clone <repository-url>
-cd lambdas-image
+cd lambda-images
 ```
 
-2. Install dependencies:
+### Step 2: Install Dependencies
+
 ```bash
+# Install project dependencies
 npm install
+
+# Install AWS CDK CLI globally (if not already installed)
+npm install -g aws-cdk
+
+# Verify installation
+cdk --version
 ```
 
-3. Create IAM User (required for CDK):
-   - AWS Console → IAM → Users → Create user
-   - Username: `cdk-deploy-user`
-   - Attach policy: `AdministratorAccess`
-   - Create access key for CLI
+### Step 3: Create IAM User for Deployment
 
-4. Configure AWS CLI:
+**Why?** CDK requires proper IAM permissions. Using a dedicated IAM user is more secure than using root credentials.
+
+1. **Go to AWS Console** → IAM → Users → **Create user**
+2. **User name**: `cdk-deploy-user` (or any name you prefer)
+3. **Attach policies directly**: Select `AdministratorAccess`
+4. **Create user**
+5. **Security credentials** tab → **Create access key**
+6. **Use case**: Select "Command Line Interface (CLI)"
+7. **Download** or copy the Access Key ID and Secret Access Key
+
+⚠️ **Important**: Save these credentials securely. You won't be able to see the secret key again!
+
+### Step 4: Configure AWS CLI
+
 ```bash
+# Configure AWS CLI with your IAM user credentials
 aws configure --profile cdk
-# Enter your IAM user credentials
-# Region: eu-north-1
-# Output: json
 
+# You'll be prompted to enter:
+# AWS Access Key ID: [paste your access key]
+# AWS Secret Access Key: [paste your secret key]
+# Default region name: eu-north-1
+# Default output format: json
+
+# Activate the profile for current session
 export AWS_PROFILE=cdk
+
+# Verify configuration
+aws sts get-caller-identity
 ```
 
-5. Bootstrap CDK (first time only):
-```bash
-cdk bootstrap aws://YOUR_ACCOUNT_ID/eu-north-1
+Expected output:
+```json
+{
+    "UserId": "AIDA...",
+    "Account": "123456789012",
+    "Arn": "arn:aws:iam::123456789012:user/cdk-deploy-user"
+}
 ```
 
-## Deployment
+### Step 5: Bootstrap CDK
 
-1. Build TypeScript:
+**Why?** CDK needs to create infrastructure in your AWS account to manage deployments (S3 bucket for assets, IAM roles, etc.)
+
+**Note:** You don't need to create a `.env` file. CDK automatically detects your AWS account and region from the AWS CLI profile.
+
 ```bash
+# Get your AWS Account ID
+AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+
+# Get your AWS Region
+AWS_REGION=$(aws configure get region)
+
+# Bootstrap CDK with proper execution policies (only needed once per account/region)
+cdk bootstrap aws://${AWS_ACCOUNT_ID}/${AWS_REGION} \
+  --cloudformation-execution-policies arn:aws:iam::aws:policy/AdministratorAccess
+```
+
+**Important:** The `--cloudformation-execution-policies` flag ensures that CDK has sufficient permissions to create and destroy all resources, including IAM roles, Lambda functions, S3 buckets, etc.
+
+Expected output:
+```
+✅  Environment aws://123456789012/eu-north-1 bootstrapped.
+```
+
+### Step 6: Build the Project
+
+```bash
+# Compile TypeScript to JavaScript
 npm run build
 ```
 
-2. Review changes:
+### Step 7: Review Infrastructure Changes (Optional)
+
 ```bash
+# See what resources will be created
+cdk synth
+
+# Or see a diff (useful for updates)
 npm run diff
 ```
 
-3. Deploy to AWS:
+### Step 8: Deploy to AWS
+
 ```bash
+# Deploy the stack
+npm run deploy
+
+# You'll be asked to approve security changes
+# Type 'y' and press Enter
+```
+
+⏱️ **Deployment takes ~2-3 minutes**
+
+Expected output:
+```
+✅  ImageProcessingStack
+
+Outputs:
+ImageProcessingStack.ApiEndpoint = https://abc123.execute-api.eu-north-1.amazonaws.com/
+ImageProcessingStack.UploadEndpoint = https://abc123.execute-api.eu-north-1.amazonaws.com/upload
+ImageProcessingStack.StatusEndpoint = https://abc123.execute-api.eu-north-1.amazonaws.com/status
+ImageProcessingStack.UploadBucketName = image-upload-123456789012-eu-north-1
+ImageProcessingStack.ProcessedBucketName = image-processed-123456789012-eu-north-1
+...
+```
+
+### Step 9: Update Frontend with API Endpoint
+
+Copy the `ApiEndpoint` from the deployment outputs and update the frontend:
+
+```bash
+# Open public/index.html and update line 10:
+# const API_ENDPOINT = 'https://YOUR_API_ID.execute-api.eu-north-1.amazonaws.com';
+```
+
+Or use this command:
+```bash
+# Extract API endpoint from outputs
+API_ENDPOINT=$(aws cloudformation describe-stacks \
+  --stack-name ImageProcessingStack \
+  --query 'Stacks[0].Outputs[?OutputKey==`ApiEndpoint`].OutputValue' \
+  --output text)
+
+# Update frontend (macOS/Linux)
+sed -i '' "s|const API_ENDPOINT = '.*'|const API_ENDPOINT = '${API_ENDPOINT}'|" public/index.html
+
+# Update frontend (Linux without macOS)
+sed -i "s|const API_ENDPOINT = '.*'|const API_ENDPOINT = '${API_ENDPOINT}'|" public/index.html
+```
+
+### Step 10: Test the Pipeline
+
+**Option A: Web Interface (Recommended)**
+
+```bash
+# Start local web server
+npm start
+
+# Browser will open at http://localhost:3000
+# 1. Select or drag & drop an image
+# 2. Click "Upload and Process"
+# 3. Wait ~5-10 seconds
+# 4. View the processed 400x400 image
+```
+
+**Option B: Command Line**
+
+```bash
+# Test with curl
+curl -X POST ${API_ENDPOINT}/upload \
+  -H "Content-Type: application/json" \
+  -d '{}'
+```
+
+### Step 11: Monitor Resources (Optional)
+
+```bash
+# View Lambda logs
+aws logs tail /aws/lambda/ImageProcessing-GetUploadUrl --follow
+
+# Check DynamoDB table
+aws dynamodb scan --table-name ImageProcessingTable
+
+# List S3 buckets
+aws s3 ls | grep image-
+
+# Check SQS queue
+aws sqs get-queue-attributes \
+  --queue-url $(aws cloudformation describe-stacks \
+    --stack-name ImageProcessingStack \
+    --query 'Stacks[0].Outputs[?OutputKey==`QueueUrl`].OutputValue' \
+    --output text) \
+  --attribute-names ApproximateNumberOfMessages
+```
+
+## 🔄 Making Changes and Redeploying
+
+After modifying the code:
+
+```bash
+# 1. Build
+npm run build
+
+# 2. See what changed
+npm run diff
+
+# 3. Deploy updates
 npm run deploy
 ```
 
-4. Note the outputs (Lambda function names, bucket names, etc.)
+## 🧹 Cleanup
+
+To remove all AWS resources and avoid charges:
+
+```bash
+# Destroy the stack
+npm run destroy
+
+# This will delete:
+# - All Lambda functions
+# - Both S3 buckets and their contents
+# - DynamoDB table and all data
+# - SQS queue
+# - API Gateway
+```
+
+⚠️ **Note**: After `npm run destroy`, you'll need to run `cdk bootstrap` again before the next deployment.
+
+## 📊 What Gets Created
+
+After deployment, you'll have:
+
+1. **API Gateway HTTP API** - Public endpoint for upload/status
+2. **4 Lambda Functions**:
+   - `ImageProcessing-GetUploadUrl` - Generates presigned URLs
+   - `ImageProcessing-ProcessUpload` - Handles S3 events
+   - `ImageProcessing-ResizeImage` - Processes images with Sharp
+   - `ImageProcessing-GetStatus` - Returns processing status
+3. **2 S3 Buckets**:
+   - `image-upload-{account}-{region}` - Original images
+   - `image-processed-{account}-{region}` - Processed images
+4. **DynamoDB Table** - `ImageProcessingTable` - Metadata storage
+5. **SQS Queue** - `ImageProcessingQueue` - Async processing trigger
+6. **CloudWatch Logs** - Automatic logging for all Lambda functions
 
 ## Usage
 
@@ -266,16 +466,175 @@ This is a serverless application with pay-per-use pricing:
 
 Estimated cost for 1000 images/month: < $1
 
-## Troubleshooting
+## 🔧 Troubleshooting
 
-### Lambda timeout
-If processing large images, increase Lambda3 timeout and memory in `lib/image-processing-stack.ts`
+### Error: "No bucket named 'cdk-hnb659fds-assets'"
 
-### Permission errors
-Ensure AWS credentials have permissions for Lambda, S3, DynamoDB, SQS, and IAM
+**Cause**: CDK bootstrap bucket doesn't exist or you're using root user credentials.
 
-### Image processing fails
-Check Lambda3 CloudWatch logs for detailed error messages
+**Solution**:
+```bash
+# 1. Make sure you're using IAM user (not root)
+aws sts get-caller-identity
+# Should show: "arn:aws:iam::ACCOUNT:user/cdk-deploy-user"
+
+# 2. Re-run bootstrap with proper execution policies
+export AWS_PROFILE=cdk
+cdk bootstrap aws://$(aws sts get-caller-identity --query Account --output text)/eu-north-1 \
+  --cloudformation-execution-policies arn:aws:iam::aws:policy/AdministratorAccess
+```
+
+### Error: "Role arn:aws:iam::ACCOUNT:role/cdk-hnb659fds-cfn-exec-role is invalid or cannot be assumed"
+
+**Cause**: CDK was bootstrapped without proper execution policies, so it cannot create/destroy resources.
+
+**Solution**: Re-bootstrap with correct policies:
+```bash
+export AWS_PROFILE=cdk
+cdk bootstrap aws://$(aws sts get-caller-identity --query Account --output text)/eu-north-1 \
+  --force \
+  --cloudformation-execution-policies arn:aws:iam::aws:policy/AdministratorAccess
+```
+
+### Error: "Stack is in UPDATE_ROLLBACK_FAILED state"
+
+**Cause**: Previous deployment failed and stack is in a bad state.
+
+**Solution**:
+```bash
+# Delete the failed stack
+aws cloudformation delete-stack --stack-name ImageProcessingStack
+
+# Wait for deletion to complete
+aws cloudformation wait stack-delete-complete --stack-name ImageProcessingStack
+
+# Deploy again
+npm run deploy
+```
+
+### Error: "User is not authorized to perform: sts:AssumeRole"
+
+**Cause**: IAM user doesn't have sufficient permissions.
+
+**Solution**:
+1. Go to AWS Console → IAM → Users → Your user
+2. Attach policy: `AdministratorAccess`
+3. Try deployment again
+
+### Lambda timeout errors
+
+**Cause**: Processing large images takes longer than the configured timeout.
+
+**Solution**: Increase timeout and memory in `lib/image-processing-stack.ts`:
+```typescript
+const lambda3 = new nodejs.NodejsFunction(stack, 'ResizeImageFunction', {
+  timeout: cdk.Duration.seconds(600),  // Increase from 300 to 600
+  memorySize: 2048,                    // Increase from 1024 to 2048
+  // ...
+});
+```
+
+### CORS errors in browser
+
+**Cause**: API endpoint not configured correctly in frontend.
+
+**Solution**:
+```bash
+# Get correct API endpoint
+aws cloudformation describe-stacks \
+  --stack-name ImageProcessingStack \
+  --query 'Stacks[0].Outputs[?OutputKey==`ApiEndpoint`].OutputValue' \
+  --output text
+
+# Update public/index.html line 10 with the correct endpoint
+```
+
+### Image processing fails silently
+
+**Cause**: Lambda function error not visible in frontend.
+
+**Solution**: Check CloudWatch logs:
+```bash
+# View ResizeImage Lambda logs
+aws logs tail /aws/lambda/ImageProcessing-ResizeImage --follow
+
+# View all Lambda logs
+aws logs tail /aws/lambda/ImageProcessing-ProcessUpload --follow
+```
+
+### "AccessDenied" errors in S3
+
+**Cause**: Lambda doesn't have permissions to access S3 buckets.
+
+**Solution**: This should be automatic via CDK. If it persists:
+```bash
+# Redeploy the stack
+npm run deploy
+```
+
+### After `npm run destroy`, next deploy fails
+
+**Cause**: CDK bootstrap resources were also deleted.
+
+**Solution**:
+```bash
+# Re-bootstrap CDK
+export AWS_PROFILE=cdk
+cdk bootstrap aws://$(aws sts get-caller-identity --query Account --output text)/eu-north-1
+
+# Deploy again
+npm run deploy
+```
+
+### DynamoDB "ResourceNotFoundException"
+
+**Cause**: Table doesn't exist or wrong table name.
+
+**Solution**:
+```bash
+# Check if table exists
+aws dynamodb describe-table --table-name ImageProcessingTable
+
+# If not exists, redeploy
+npm run deploy
+```
+
+### SQS messages not being processed
+
+**Cause**: Lambda3 not triggered by SQS.
+
+**Solution**: Check SQS queue depth:
+```bash
+# Get queue URL from outputs
+QUEUE_URL=$(aws cloudformation describe-stacks \
+  --stack-name ImageProcessingStack \
+  --query 'Stacks[0].Outputs[?OutputKey==`QueueUrl`].OutputValue' \
+  --output text)
+
+# Check messages in queue
+aws sqs get-queue-attributes \
+  --queue-url $QUEUE_URL \
+  --attribute-names ApproximateNumberOfMessages
+
+# If messages are stuck, check Lambda3 logs
+aws logs tail /aws/lambda/ImageProcessing-ResizeImage --follow
+```
+
+### Need to change AWS region
+
+**Solution**:
+```bash
+# 1. Update AWS CLI profile
+aws configure --profile cdk
+# Enter new region (e.g., us-east-1)
+
+# 2. Bootstrap new region
+cdk bootstrap aws://$(aws sts get-caller-identity --query Account --output text)/us-east-1
+
+# 3. Update bin/app.ts if you hardcoded region
+# 4. Deploy
+npm run deploy
+```
 
 ## License
 

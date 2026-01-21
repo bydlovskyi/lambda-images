@@ -17,7 +17,8 @@ export function createImageProcessingStack(scope: Construct, id: string, props?:
     bucketName: `image-upload-${stack.account}-${stack.region}`,
     blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
     encryption: s3.BucketEncryption.S3_MANAGED,
-    removalPolicy: cdk.RemovalPolicy.RETAIN,
+    removalPolicy: cdk.RemovalPolicy.DESTROY,
+    autoDeleteObjects: true,
     cors: [
       {
         allowedMethods: [s3.HttpMethods.PUT, s3.HttpMethods.POST, s3.HttpMethods.GET, s3.HttpMethods.HEAD],
@@ -32,7 +33,8 @@ export function createImageProcessingStack(scope: Construct, id: string, props?:
     bucketName: `image-processed-${stack.account}-${stack.region}`,
     blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
     encryption: s3.BucketEncryption.S3_MANAGED,
-    removalPolicy: cdk.RemovalPolicy.RETAIN,
+    removalPolicy: cdk.RemovalPolicy.DESTROY,
+    autoDeleteObjects: true,
   });
 
   const table = new dynamodb.Table(stack, 'ImageTable', {
@@ -40,6 +42,7 @@ export function createImageProcessingStack(scope: Construct, id: string, props?:
     partitionKey: { name: 'imageId', type: dynamodb.AttributeType.STRING },
     billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
     removalPolicy: cdk.RemovalPolicy.DESTROY,
+    timeToLiveAttribute: 'expiresAt'
   });
 
   const queue = new sqs.Queue(stack, 'ImageProcessingQueue', {
@@ -125,7 +128,6 @@ export function createImageProcessingStack(scope: Construct, id: string, props?:
   table.grantReadData(lambda4);
   processedBucket.grantRead(lambda4);
 
-  // API Gateway HTTP API
   const httpApi = new apigatewayv2.HttpApi(stack, 'ImageProcessingApi', {
     apiName: 'ImageProcessingApi',
     description: 'HTTP API for Image Processing Pipeline',
@@ -136,7 +138,6 @@ export function createImageProcessingStack(scope: Construct, id: string, props?:
     },
   });
 
-  // Lambda1 integration - POST /upload
   const lambda1Integration = new apigatewayv2Integrations.HttpLambdaIntegration('Lambda1Integration', lambda1);
   httpApi.addRoutes({
     path: '/upload',
@@ -144,7 +145,6 @@ export function createImageProcessingStack(scope: Construct, id: string, props?:
     integration: lambda1Integration,
   });
 
-  // Lambda4 integration - GET /status
   const lambda4Integration = new apigatewayv2Integrations.HttpLambdaIntegration('Lambda4Integration', lambda4);
   httpApi.addRoutes({
     path: '/status',
@@ -154,57 +154,57 @@ export function createImageProcessingStack(scope: Construct, id: string, props?:
 
   new cdk.CfnOutput(stack, 'UploadBucketName', {
     value: uploadBucket.bucketName,
-    description: 'Upload S3 Bucket Name',
+    description: '1. Upload S3 Bucket Name',
   });
 
   new cdk.CfnOutput(stack, 'ProcessedBucketName', {
     value: processedBucket.bucketName,
-    description: 'Processed S3 Bucket Name',
+    description: '2. Processed S3 Bucket Name',
   });
 
   new cdk.CfnOutput(stack, 'TableName', {
     value: table.tableName,
-    description: 'DynamoDB Table Name',
+    description: '3. DynamoDB Table Name',
   });
 
   new cdk.CfnOutput(stack, 'QueueUrl', {
     value: queue.queueUrl,
-    description: 'SQS Queue URL',
+    description: '4. SQS Queue URL',
   });
 
   new cdk.CfnOutput(stack, 'Lambda1FunctionName', {
     value: lambda1.functionName,
-    description: 'Lambda1 (Get Upload URL) Function Name',
+    description: '5. Lambda1 (Get Upload URL) Function Name',
   });
 
   new cdk.CfnOutput(stack, 'Lambda2FunctionName', {
     value: lambda2.functionName,
-    description: 'Lambda2 (Process Upload) Function Name',
+    description: '6. Lambda2 (Process Upload) Function Name',
   });
 
   new cdk.CfnOutput(stack, 'Lambda3FunctionName', {
     value: lambda3.functionName,
-    description: 'Lambda3 (Resize Image) Function Name',
+    description: '7. Lambda3 (Resize Image) Function Name',
   });
 
   new cdk.CfnOutput(stack, 'Lambda4FunctionName', {
     value: lambda4.functionName,
-    description: 'Lambda4 (Get Status) Function Name',
+    description: '8. Lambda4 (Get Status) Function Name',
   });
 
   new cdk.CfnOutput(stack, 'ApiEndpoint', {
     value: httpApi.url!,
-    description: 'API Gateway HTTP API Endpoint',
+    description: '9. API Gateway HTTP API Endpoint',
   });
 
   new cdk.CfnOutput(stack, 'UploadEndpoint', {
     value: `${httpApi.url}upload`,
-    description: 'POST /upload - Get Upload URL',
+    description: '10. POST /upload - Get Upload URL',
   });
 
   new cdk.CfnOutput(stack, 'StatusEndpoint', {
     value: `${httpApi.url}status`,
-    description: 'GET /status - Get Image Status',
+    description: '11. GET /status - Get Image Status',
   });
 
   return stack;

@@ -31,6 +31,7 @@ export const handler = async (event: S3Event): Promise<void> => {
             size,
             status: 'pending',
             uploadedAt: new Date().toISOString(),
+            expiresAt: Math.floor(Date.now() / 1000) + 7 * 24 * 60 * 60
           },
         })
       );
