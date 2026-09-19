@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="uk">
+<html lang="en">
 
 <head>
   <meta charset="UTF-8">
@@ -7,7 +7,19 @@
   <title>Image Processing Pipeline</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <script>
-    const API_ENDPOINT = 'https://615ltxs3q4.execute-api.eu-north-1.amazonaws.com';
+    // Resolved at runtime: ?api=https://… in the URL wins, then the value saved from a previous
+    // visit, then the placeholder below (replace it with your ApiEndpoint stack output).
+    const DEFAULT_API_ENDPOINT = 'https://YOUR_API_ID.execute-api.YOUR_REGION.amazonaws.com';
+    const API_ENDPOINT = (() => {
+      const fromQuery = new URLSearchParams(location.search).get('api');
+      if (fromQuery) {
+        try { localStorage.setItem('apiEndpoint', fromQuery); } catch { /* private mode */ }
+        return fromQuery;
+      }
+      try { return localStorage.getItem('apiEndpoint') || DEFAULT_API_ENDPOINT; } catch { return DEFAULT_API_ENDPOINT; }
+    })().replace(/\/$/, '');
+    const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
+    const ALLOWED_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
   </script>
 </head>
 
@@ -22,12 +34,12 @@
         <div
           class="border-2 border-dashed border-gray-300 rounded-lg p-8 text-center hover:border-blue-500 transition-colors"
           id="dropZone">
-          <input type="file" id="fileInput" accept="image/*" class="hidden">
+          <input type="file" id="fileInput" accept="image/jpeg,image/png,image/webp,image/gif" class="hidden">
           <button onclick="document.getElementById('fileInput').click()"
             class="bg-blue-600 hover:bg-blue-700 text-white font-semibold py-3 px-6 rounded-lg transition-colors">
             Choose File
           </button>
-          <p class="text-gray-500 mt-4 text-sm">or drag and drop file here</p>
+          <p class="text-gray-500 mt-4 text-sm">or drag and drop — JPEG, PNG, WebP or GIF up to 10 MB</p>
           <p id="fileName" class="text-gray-700 mt-2 font-medium"></p>
         </div>
       </div>
@@ -91,8 +103,18 @@
     const logDiv = document.getElementById('log');
 
     fileInput.addEventListener('change', (e) => {
-      selectedFile = e.target.files[0];
-      if (selectedFile) {
+      const file = e.target.files[0];
+      if (!file) return;
+      if (!ALLOWED_TYPES.includes(file.type)) {
+        addLog(`❌ Unsupported type "${file.type || 'unknown'}" — use JPEG, PNG, WebP or GIF`, 'error');
+        return;
+      }
+      if (file.size > MAX_UPLOAD_BYTES) {
+        addLog(`❌ File is ${(file.size / 1024 / 1024).toFixed(1)} MB; the limit is 10 MB`, 'error');
+        return;
+      }
+      selectedFile = file;
+      {
         document.getElementById('fileName').textContent = `Selected: ${selectedFile.name}`;
         uploadBtn.disabled = false;
         const reader = new FileReader();
@@ -132,10 +154,10 @@
         const response = await fetch(`${API_ENDPOINT}/upload`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({})
+          body: JSON.stringify({ contentType: selectedFile.type, contentLength: selectedFile.size })
         });
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        const data = await response.json();
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
         currentImageId = data.imageId;
         document.getElementById('imageId').textContent = currentImageId;
         addLog(`✅ Upload URL received (ID: ${currentImageId})`);
@@ -145,7 +167,7 @@
           body: selectedFile,
           headers: { 'Content-Type': selectedFile.type }
         });
-        if (!uploadResponse.ok) throw new Error('S3 upload failed');
+        if (!uploadResponse.ok) throw new Error(`S3 upload failed (HTTP ${uploadResponse.status})`);
         addLog('✅ File uploaded to S3');
         updateStatus('pending', '⏳ Processing...');
         addLog('⏳ Waiting for processing...');
@@ -182,8 +204,9 @@
           updateStatus('pending', '⏳ Processing...');
           setTimeout(() => checkStatus(), 2000);
         } else {
-          addLog(`❌ Status: ${data.status}`, 'error');
+          addLog(`❌ Processing failed: ${data.errorMessage || data.status}`, 'error');
           updateStatus('error', '❌ Error');
+          uploadBtn.disabled = false;
         }
       } catch (error) {
         addLog(`❌ Error: ${error.message}`, 'error');
@@ -195,7 +218,13 @@
       logEntry.className = 'mb-1';
       const timestamp = new Date().toLocaleTimeString('uk-UA');
       const colors = { info: 'text-green-400', warning: 'text-yellow-400', error: 'text-red-400' };
-      logEntry.innerHTML = `<span class="text-gray-500">[${timestamp}]</span> <span class="${colors[type]}">${message}</span>`;
+      const time = document.createElement('span');
+      time.className = 'text-gray-500';
+      time.textContent = `[${timestamp}] `;
+      const text = document.createElement('span');
+      text.className = colors[type];
+      text.textContent = message;
+      logEntry.append(time, text);
       if (logDiv.querySelector('.text-gray-500:only-child')) logDiv.innerHTML = '';
       logDiv.appendChild(logEntry);
       logDiv.scrollTop = logDiv.scrollHeight;
@@ -209,7 +238,11 @@
     }
 
     addLog('🚀 Image Processing Pipeline ready');
-    addLog('✅ API Gateway configured');
+    if (API_ENDPOINT.includes('YOUR_API_ID')) {
+      addLog('⚠️ API endpoint not configured — open this page with ?api=<ApiEndpoint> or edit DEFAULT_API_ENDPOINT', 'warning');
+    } else {
+      addLog(`✅ API endpoint: ${API_ENDPOINT}`);
+    }
   </script>
 </body>
 

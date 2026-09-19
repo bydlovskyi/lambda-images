@@ -1,43 +1,32 @@
-# Contributing Guide
+# Contributing
 
-## Development Setup
+## Setup
 
-1. Fork and clone the repository
-2. Install dependencies: `npm install`
-3. Configure AWS CLI with IAM user (see README.md)
-4. Make your changes
-5. Test locally: `npm run build && cdk synth`
-6. Submit a pull request
+```bash
+git clone <repo>
+cd lambda-images
+npm ci
+```
 
-## Code Style
+Requirements: Node.js ≥ 22 and npm ≥ 10.4 (needed to install the Linux build of Sharp from any host).
 
-- Use TypeScript strict mode
-- Follow existing code patterns
-- Add error handling
-- Include logging statements
-- Write descriptive variable names
+## Before you open a pull request
 
-## Testing
+```bash
+npm run typecheck   # strict TypeScript, no emit
+npm test            # vitest — Lambda handlers with mocked AWS SDK, real Sharp, CDK template assertions
+npm run synth       # the stack must synthesise; no AWS credentials needed
+```
 
-Before submitting:
-1. Build: `npm run build`
-2. Lint: Check for TypeScript errors
-3. Test deployment: `cdk synth`
-4. Test functionality with real AWS resources
+CI runs exactly these three steps on every push and pull request.
 
-## Commit Messages
+## Ground rules
 
-Use conventional commits:
-- `feat:` New feature
-- `fix:` Bug fix
-- `docs:` Documentation changes
-- `refactor:` Code refactoring
-- `test:` Testing changes
+- Shared contracts (DynamoDB item, SQS payload, HTTP responses) live in `types/image-record.ts` — import them, don't redeclare.
+- Handlers never return `error.message` to clients; internal details go to CloudWatch only.
+- Infrastructure guarantees the README promises (DLQ, visibility timeout, TTL, log retention) are pinned by `test/stack.test.ts`. If you change one on purpose, update the test and the README in the same commit.
+- Keep Lambda IAM grants scoped to the key prefix the function actually touches.
 
-## Pull Request Process
+## Commit messages
 
-1. Update README.md if needed
-2. Update DEPLOYMENT.md for infrastructure changes
-3. Describe your changes clearly
-4. Link related issues
-5. Wait for review
+Conventional commits: `feat:`, `fix:`, `docs:`, `refactor:`, `test:`, `chore:`.

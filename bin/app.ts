@@ -1,16 +1,13 @@
 #!/usr/bin/env node
-import 'source-map-support/register';
 import * as cdk from 'aws-cdk-lib';
-import { createImageProcessingStack } from '../lib/image-processing-stack';
+import { ImageProcessingStack } from '../lib/image-processing-stack';
 
 const app = new cdk.App();
 
-createImageProcessingStack(app, 'ImageProcessingStack', {
+new ImageProcessingStack(app, 'ImageProcessingStack', {
   env: {
     account: process.env.CDK_DEFAULT_ACCOUNT,
-    region: process.env.CDK_DEFAULT_REGION || 'us-east-1',
+    region: process.env.CDK_DEFAULT_REGION,
   },
-  description: 'Serverless Image Processing Pipeline with S3, Lambda, SQS, and DynamoDB',
+  description: 'Serverless image processing pipeline: S3 → Lambda → SQS → Sharp → DynamoDB',
 });
-
-app.synth();

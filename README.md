@@ -1,641 +1,272 @@
-# AWS Image Processing Pipeline
+# Serverless Image Processing Pipeline
 
-Serverless image processing pipeline using AWS services (S3, SQS, DynamoDB, and Lambda) to automatically process uploaded images.
+[![CI](https://github.com/Bydlovskiy/lambda-images/actions/workflows/ci.yml/badge.svg)](https://github.com/Bydlovskiy/lambda-images/actions/workflows/ci.yml)
+![Node 22](https://img.shields.io/badge/node-22-339933?logo=node.js&logoColor=white)
+![AWS CDK v2](https://img.shields.io/badge/AWS%20CDK-v2-FF9900?logo=amazonaws&logoColor=white)
+![TypeScript strict](https://img.shields.io/badge/TypeScript-strict-3178C6?logo=typescript&logoColor=white)
+![License MIT](https://img.shields.io/badge/license-MIT-blue)
+
+An event-driven image pipeline on AWS: the browser uploads straight to S3 through a presigned URL,
+an SQS-backed Lambda resizes the image with [Sharp](https://sharp.pixelplumbing.com/), and a tiny
+HTTP API reports progress and hands back a presigned download link. Everything — infrastructure,
+handlers, tests — is TypeScript, deployed with AWS CDK.
+
+The point of the project is not the resize; it is showing the operational details that separate a
+demo from something you would run: dead-lettering, bounded retries, TTLs, least-privilege IAM,
+input validation at the edge, and a test suite that pins all of it.
 
 ## Architecture
 
-The pipeline consists of:
+```mermaid
+graph TB
+    Client[Browser / API client]
 
-- **API Gateway HTTP API** - REST endpoints for upload and status
-- **4 Lambda Functions**:
-  1. **GetUploadUrl** - Generates presigned S3 upload URL (300s TTL)
-  2. **ProcessUpload** - Triggered by S3 event, creates DynamoDB record and sends SQS message
-  3. **ResizeImage** - Triggered by SQS, resizes image to 400x400 using Sharp
-  4. **GetStatus** - Returns processing status and download URL (600s TTL)
-- **Frontend** - Web interface with drag & drop upload
+    subgraph API["API Gateway (HTTP API)"]
+        Upload[POST /upload]
+        Status[GET /status]
+    end
 
-## AWS Resources
+    subgraph Compute["Lambda · Node.js 22 · arm64"]
+        L1[GetUploadUrl]
+        L2[ProcessUpload]
+        L3["ResizeImage<br/>Sharp · 1024 MB · 60 s"]
+        L4[GetStatus]
+    end
 
-- **API Gateway HTTP API**: REST endpoints (`/upload`, `/status`)
-- **S3 Bucket (Upload)**: Private bucket for original images with encryption
-- **S3 Bucket (Processed)**: Private bucket for resized images with encryption
-- **DynamoDB Table**: Stores image metadata and processing status
-- **SQS Queue**: Async trigger for image processing
-- **4 Lambda Functions**: Node.js 20.x with automatic bundling
-- **CloudWatch Logs**: All Lambda execution logs
+    subgraph Storage
+        S3U["S3 upload bucket<br/>private · SSE-S3 · TLS only<br/>expires after 7 days"]
+        S3P["S3 processed bucket<br/>private · SSE-S3 · TLS only<br/>expires after 7 days"]
+        DDB[("DynamoDB<br/>PK imageId · TTL expiresAt")]
+    end
 
-## Prerequisites
+    subgraph Queue
+        SQS["SQS ImageProcessingQueue<br/>visibility 360 s · batch 1"]
+        DLQ["SQS ImageProcessingDLQ<br/>after 3 failed receives"]
+        Alarm["CloudWatch alarm<br/>DLQ not empty"]
+    end
 
-- **AWS Account** - [Create one here](https://aws.amazon.com/)
-- **Node.js 18+** and npm - [Download here](https://nodejs.org/)
-- **AWS CDK CLI** - Will be installed in step 2
-- **AWS CLI** - [Install guide](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html)
-- **Git** - For cloning the repository
+    Client -->|1. contentType + size| Upload --> L1
+    L1 -->|presigned PUT, 5 min<br/>type + length signed| Client
+    Client -->|2. PUT image| S3U
+    S3U -->|3. ObjectCreated uploads/| L2
+    L2 -->|PutItem status=pending| DDB
+    L2 -->|SendMessage| SQS
+    SQS -->|4.| L3
+    SQS -.->|retries exhausted| DLQ -.-> Alarm
+    L3 -->|GetObject| S3U
+    L3 -->|PutObject 400×400| S3P
+    L3 -->|UpdateItem ok / error| DDB
+    Client -->|5. poll| Status --> L4
+    L4 -->|GetItem| DDB
+    L4 -->|presigned GET, 10 min| Client
+    Client -->|6. download| S3P
+```
 
-## 🚀 Getting Started from Scratch
+Sequence, state and IAM diagrams: [diagrams/architecture-mermaid.md](diagrams/architecture-mermaid.md).
 
-Follow these steps to deploy the entire pipeline from scratch:
+### Flow
 
-### Step 1: Clone the Repository
+1. **`POST /upload`** — client declares `contentType` and `contentLength`. The Lambda validates
+   both (JPEG/PNG/WebP/GIF, ≤ 10 MB) and returns a presigned PUT URL valid for 5 minutes.
+2. **PUT to S3** — Content-Type and Content-Length are part of the signature, so S3 rejects any
+   upload that does not match what was declared. The bucket is private; the URL is the only way in.
+3. **`ObjectCreated`** on `uploads/` triggers **ProcessUpload**: it writes a `pending` record with a
+   7-day TTL, then enqueues `{imageId, bucket, key}`.
+4. **ResizeImage** consumes the queue one message at a time, decodes with a pixel-count ceiling,
+   applies EXIF rotation, crops to 400×400, stores the result and marks the record `ok`.
+5. **`GET /status?imageId=…`** returns `pending` / `ok` / `error`; once `ok`, it includes a presigned
+   download URL valid for 10 minutes.
+
+## Design decisions
+
+| Concern | What the stack does | Why |
+| --- | --- | --- |
+| **Poison messages** | Main queue redrives to a DLQ after 3 receives; a CloudWatch alarm fires when the DLQ is non-empty. | Without a DLQ a bad message is retried for the whole 4-day retention period — every attempt downloads from S3, spins up Sharp and writes to DynamoDB. |
+| **Permanent vs transient failures** | A corrupt or unsupported image is recorded as `error` and *acknowledged*. S3/DynamoDB failures are recorded and *rethrown*. | Retrying a broken file cannot help; retrying a throttled DynamoDB call can. The DLQ only ever contains things worth a human's attention. |
+| **Visibility timeout** | `6 × function timeout` (60 s → 360 s), derived from one constant. | AWS's recommendation for Lambda consumers. Equal values let a message become visible while the previous invocation is still finishing, causing duplicate processing. |
+| **Data retention** | DynamoDB TTL on `expiresAt` + S3 lifecycle rules on both buckets, all 7 days. | Records and objects age out together; nothing accumulates silently. |
+| **Upload validation** | Type and size are checked in the Lambda *and* signed into the presigned URL. | The Lambda check gives a friendly 400; the signature makes it impossible to bypass by editing the request. |
+| **Decompression bombs** | `sharp({ limitInputPixels: 25_000_000 })` | A few-KB PNG can expand to gigabytes of pixels. The cap fails fast instead of OOM-killing a 1 GB function. |
+| **Least privilege** | Each function is granted exactly the actions and key prefixes it uses (`uploads/*`, `processed/*`). | Blast radius of a compromised function stays small. |
+| **Error responses** | Clients get `{ "error": "Failed to get image status" }`; the stack trace goes to CloudWatch. | Internal ARNs, table names and SDK messages are not a client's business. |
+| **Log retention** | Explicit log group per function, 14 days. | Default Lambda log groups never expire. |
+| **Sharp on Lambda** | Bundling hook installs the `linux-arm64` build explicitly and fails loudly if it is missing. | `esbuild` cannot bundle native binaries; the naïve approach silently ships the host OS's build and crashes at runtime. |
+| **Shared contracts** | `types/image-record.ts` defines the DynamoDB item, the SQS payload and both HTTP responses; every handler imports them. | One definition, one place to change it, and the compiler catches drift. |
+
+## Quick start
+
+Prerequisites: Node.js ≥ 22, npm ≥ 10.4, an AWS account with CLI credentials configured.
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/Bydlovskiy/lambda-images.git
 cd lambda-images
+npm ci
+
+npm run typecheck && npm test         # no AWS access needed
+npx cdk bootstrap                     # once per account/region
+npm run deploy                        # ~2 minutes
 ```
 
-### Step 2: Install Dependencies
+Deployment prints the API endpoint:
 
-```bash
-# Install project dependencies
-npm install
-
-# Install AWS CDK CLI globally (if not already installed)
-npm install -g aws-cdk
-
-# Verify installation
-cdk --version
 ```
-
-### Step 3: Create IAM User for Deployment
-
-**Why?** CDK requires proper IAM permissions. Using a dedicated IAM user is more secure than using root credentials.
-
-1. **Go to AWS Console** → IAM → Users → **Create user**
-2. **User name**: `cdk-deploy-user` (or any name you prefer)
-3. **Attach policies directly**: Select `AdministratorAccess`
-4. **Create user**
-5. **Security credentials** tab → **Create access key**
-6. **Use case**: Select "Command Line Interface (CLI)"
-7. **Download** or copy the Access Key ID and Secret Access Key
-
-⚠️ **Important**: Save these credentials securely. You won't be able to see the secret key again!
-
-### Step 4: Configure AWS CLI
-
-```bash
-# Configure AWS CLI with your IAM user credentials
-aws configure --profile cdk
-
-# You'll be prompted to enter:
-# AWS Access Key ID: [paste your access key]
-# AWS Secret Access Key: [paste your secret key]
-# Default region name: eu-north-1
-# Default output format: json
-
-# Activate the profile for current session
-export AWS_PROFILE=cdk
-
-# Verify configuration
-aws sts get-caller-identity
-```
-
-Expected output:
-```json
-{
-    "UserId": "AIDA...",
-    "Account": "123456789012",
-    "Arn": "arn:aws:iam::123456789012:user/cdk-deploy-user"
-}
-```
-
-### Step 5: Bootstrap CDK
-
-**Why?** CDK needs to create infrastructure in your AWS account to manage deployments (S3 bucket for assets, IAM roles, etc.)
-
-**Note:** You don't need to create a `.env` file. CDK automatically detects your AWS account and region from the AWS CLI profile.
-
-```bash
-# Get your AWS Account ID
-AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-
-# Get your AWS Region
-AWS_REGION=$(aws configure get region)
-
-# Bootstrap CDK with proper execution policies (only needed once per account/region)
-cdk bootstrap aws://${AWS_ACCOUNT_ID}/${AWS_REGION} \
-  --cloudformation-execution-policies arn:aws:iam::aws:policy/AdministratorAccess
-```
-
-**Important:** The `--cloudformation-execution-policies` flag ensures that CDK has sufficient permissions to create and destroy all resources, including IAM roles, Lambda functions, S3 buckets, etc.
-
-Expected output:
-```
-✅  Environment aws://123456789012/eu-north-1 bootstrapped.
-```
-
-### Step 6: Build the Project
-
-```bash
-# Compile TypeScript to JavaScript
-npm run build
-```
-
-### Step 7: Review Infrastructure Changes (Optional)
-
-```bash
-# See what resources will be created
-cdk synth
-
-# Or see a diff (useful for updates)
-npm run diff
-```
-
-### Step 8: Deploy to AWS
-
-```bash
-# Deploy the stack
-npm run deploy
-
-# You'll be asked to approve security changes
-# Type 'y' and press Enter
-```
-
-⏱️ **Deployment takes ~2-3 minutes**
-
-Expected output:
-```
-✅  ImageProcessingStack
-
 Outputs:
 ImageProcessingStack.ApiEndpoint = https://abc123.execute-api.eu-north-1.amazonaws.com/
-ImageProcessingStack.UploadEndpoint = https://abc123.execute-api.eu-north-1.amazonaws.com/upload
-ImageProcessingStack.StatusEndpoint = https://abc123.execute-api.eu-north-1.amazonaws.com/status
-ImageProcessingStack.UploadBucketName = image-upload-123456789012-eu-north-1
-ImageProcessingStack.ProcessedBucketName = image-processed-123456789012-eu-north-1
 ...
 ```
 
-### Step 9: Update Frontend with API Endpoint
-
-Copy the `ApiEndpoint` from the deployment outputs and update the frontend:
+### Try it in the browser
 
 ```bash
-# Open public/index.html and update line 10:
-# const API_ENDPOINT = 'https://YOUR_API_ID.execute-api.eu-north-1.amazonaws.com';
+npm start   # serves public/ on http://localhost:3000
 ```
 
-Or use this command:
-```bash
-# Extract API endpoint from outputs
-API_ENDPOINT=$(aws cloudformation describe-stacks \
-  --stack-name ImageProcessingStack \
-  --query 'Stacks[0].Outputs[?OutputKey==`ApiEndpoint`].OutputValue' \
-  --output text)
+Open `http://localhost:3000/?api=https://abc123.execute-api.eu-north-1.amazonaws.com` — the endpoint
+is remembered in `localStorage`, so the query parameter is only needed once. Drop an image on the
+page and watch the event log walk through the pipeline.
 
-# Update frontend (macOS/Linux)
-sed -i '' "s|const API_ENDPOINT = '.*'|const API_ENDPOINT = '${API_ENDPOINT}'|" public/index.html
-
-# Update frontend (Linux without macOS)
-sed -i "s|const API_ENDPOINT = '.*'|const API_ENDPOINT = '${API_ENDPOINT}'|" public/index.html
-```
-
-### Step 10: Test the Pipeline
-
-**Option A: Web Interface (Recommended)**
+### Try it with curl
 
 ```bash
-# Start local web server
-npm start
+API=https://abc123.execute-api.eu-north-1.amazonaws.com
 
-# Browser will open at http://localhost:3000
-# 1. Select or drag & drop an image
-# 2. Click "Upload and Process"
-# 3. Wait ~5-10 seconds
-# 4. View the processed 400x400 image
+# 1. Request an upload URL for a specific file
+FILE=photo.jpg
+RES=$(curl -s -X POST "$API/upload" -H 'Content-Type: application/json' \
+  -d "{\"contentType\":\"image/jpeg\",\"contentLength\":$(stat -f%z "$FILE")}")
+UPLOAD_URL=$(echo "$RES" | jq -r .uploadUrl)
+IMAGE_ID=$(echo "$RES" | jq -r .imageId)
+
+# 2. Upload — headers must match what was declared
+curl -s -X PUT -H 'Content-Type: image/jpeg' --data-binary @"$FILE" "$UPLOAD_URL"
+
+# 3. Poll until status is "ok"
+sleep 5; curl -s "$API/status?imageId=$IMAGE_ID" | jq
+
+# 4. Download the 400×400 result
+curl -s "$(curl -s "$API/status?imageId=$IMAGE_ID" | jq -r .downloadUrl)" -o resized.jpg
 ```
 
-**Option B: Command Line**
+## API
 
-```bash
-# Test with curl
-curl -X POST ${API_ENDPOINT}/upload \
-  -H "Content-Type: application/json" \
-  -d '{}'
+### `POST /upload`
+
+Request:
+
+```json
+{ "contentType": "image/jpeg", "contentLength": 245760 }
 ```
 
-### Step 11: Monitor Resources (Optional)
+`contentType` ∈ `image/jpeg | image/png | image/webp | image/gif`; `contentLength` is a positive
+integer ≤ 10 485 760.
 
-```bash
-# View Lambda logs
-aws logs tail /aws/lambda/ImageProcessing-GetUploadUrl --follow
+Response `200`:
 
-# Check DynamoDB table
-aws dynamodb scan --table-name ImageProcessingTable
-
-# List S3 buckets
-aws s3 ls | grep image-
-
-# Check SQS queue
-aws sqs get-queue-attributes \
-  --queue-url $(aws cloudformation describe-stacks \
-    --stack-name ImageProcessingStack \
-    --query 'Stacks[0].Outputs[?OutputKey==`QueueUrl`].OutputValue' \
-    --output text) \
-  --attribute-names ApproximateNumberOfMessages
-```
-
-## 🔄 Making Changes and Redeploying
-
-After modifying the code:
-
-```bash
-# 1. Build
-npm run build
-
-# 2. See what changed
-npm run diff
-
-# 3. Deploy updates
-npm run deploy
-```
-
-## 🧹 Cleanup
-
-To remove all AWS resources and avoid charges:
-
-```bash
-# Destroy the stack
-npm run destroy
-
-# This will delete:
-# - All Lambda functions
-# - Both S3 buckets and their contents
-# - DynamoDB table and all data
-# - SQS queue
-# - API Gateway
-```
-
-⚠️ **Note**: After `npm run destroy`, you'll need to run `cdk bootstrap` again before the next deployment.
-
-## 📊 What Gets Created
-
-After deployment, you'll have:
-
-1. **API Gateway HTTP API** - Public endpoint for upload/status
-2. **4 Lambda Functions**:
-   - `ImageProcessing-GetUploadUrl` - Generates presigned URLs
-   - `ImageProcessing-ProcessUpload` - Handles S3 events
-   - `ImageProcessing-ResizeImage` - Processes images with Sharp
-   - `ImageProcessing-GetStatus` - Returns processing status
-3. **2 S3 Buckets**:
-   - `image-upload-{account}-{region}` - Original images
-   - `image-processed-{account}-{region}` - Processed images
-4. **DynamoDB Table** - `ImageProcessingTable` - Metadata storage
-5. **SQS Queue** - `ImageProcessingQueue` - Async processing trigger
-6. **CloudWatch Logs** - Automatic logging for all Lambda functions
-
-## Usage
-
-### Option 1: Web Interface (Recommended)
-
-```bash
-npm start
-# Opens http://localhost:3000
-# 1. Select or drag & drop an image
-# 2. Click "Upload and Process"
-# 3. Wait ~10 seconds
-# 4. View processed 400x400 image
-```
-
-### Option 2: API Endpoints
-
-#### 1. Get Upload URL
-
-```bash
-curl -X POST https://YOUR_API_ID.execute-api.eu-north-1.amazonaws.com/upload \
-  -H "Content-Type: application/json" \
-  -d '{}'
-```
-
-Response:
 ```json
 {
-  "uploadUrl": "https://...",
-  "imageId": "uuid",
-  "key": "uploads/uuid",
+  "uploadUrl": "https://image-upload-….s3.eu-north-1.amazonaws.com/uploads/…?X-Amz-…",
+  "imageId": "6f1c1d2e-3b4a-4c5d-8e9f-0a1b2c3d4e5f",
+  "key": "uploads/6f1c1d2e-3b4a-4c5d-8e9f-0a1b2c3d4e5f",
   "expiresIn": 300
 }
 ```
 
-### 2. Upload Image
+`400` with `{ "error": "…" }` on validation failure.
 
-Upload an image using the presigned URL:
+### `GET /status?imageId=<uuid>`
 
-```bash
-curl -X PUT \
-  -H "Content-Type: image/jpeg" \
-  --data-binary @your-image.jpg \
-  "<uploadUrl>"
-```
+| Status | Response |
+| --- | --- |
+| pending | `{ "imageId", "status": "pending", "uploadedAt" }` |
+| ok | `{ "imageId", "status": "ok", "uploadedAt", "processedAt", "downloadUrl", "expiresIn": 600 }` |
+| error | `{ "imageId", "status": "error", "uploadedAt", "errorMessage" }` |
 
-#### 3. Check Status
+`400` for a missing or malformed `imageId`, `404` if unknown, `500` (no internal details) otherwise.
 
-```bash
-curl "https://YOUR_API_ID.execute-api.eu-north-1.amazonaws.com/status?imageId=<your-image-id>"
-```
+### DynamoDB item
 
-Response (pending):
-```json
-{
-  "imageId": "uuid",
-  "status": "pending",
-  "uploadedAt": "2024-01-01T00:00:00.000Z"
-}
-```
-
-Response (completed):
-```json
-{
-  "imageId": "uuid",
-  "status": "ok",
-  "uploadedAt": "2024-01-01T00:00:00.000Z",
-  "processedAt": "2024-01-01T00:00:10.000Z",
-  "downloadUrl": "https://...",
-  "expiresIn": 600
-}
-```
-
-### 4. Download Processed Image
-
-Use the `downloadUrl` from step 3:
-
-```bash
-curl "<downloadUrl>" -o processed-image.jpg
-```
+| Attribute | Type | Notes |
+| --- | --- | --- |
+| `imageId` | string | partition key, UUID v4 |
+| `status` | `pending` \| `ok` \| `error` | |
+| `originalKey`, `processedKey` | string | S3 keys |
+| `bucket` | string | source bucket |
+| `size` | number | original size in bytes |
+| `uploadedAt`, `processedAt` | ISO-8601 string | |
+| `errorMessage` | string | only when `status = error` |
+| `expiresAt` | number | epoch seconds, DynamoDB TTL |
 
 ## Testing
 
-### Test Script
-
 ```bash
-# Set your API endpoint
-export API_ENDPOINT=https://YOUR_API_ID.execute-api.eu-north-1.amazonaws.com
-
-# Run test
-./scripts/test-pipeline.sh path/to/image.jpg
+npm test
 ```
 
-### Manual Testing
+35 tests in five files, no AWS access required:
 
-```bash
-# 1. Get upload URL
-RESPONSE=$(curl -s -X POST $API_ENDPOINT/upload -H "Content-Type: application/json" -d '{}')
-UPLOAD_URL=$(echo $RESPONSE | jq -r '.uploadUrl')
-IMAGE_ID=$(echo $RESPONSE | jq -r '.imageId')
+- **Handlers** — every Lambda runs against `aws-sdk-client-mock`. Sharp is *not* mocked: the resize
+  test generates a real 800×600 JPEG and asserts the output decodes to 400×400. There are cases for
+  the decompression-bomb limit, malformed queue messages, the permanent-vs-transient error split, and
+  the "no error leakage on 500" guarantee.
+- **Stack** — `aws-cdk-lib/assertions` pins the infrastructure promises: DLQ with `maxReceiveCount: 3`,
+  visibility timeout = 6 × function timeout, TTL on `expiresAt`, 14-day log retention on every function,
+  private + encrypted + expiring buckets, exactly two public routes.
 
-# 2. Upload image
-curl -X PUT -H "Content-Type: image/jpeg" --data-binary @test-image.jpg "$UPLOAD_URL"
+CI (`.github/workflows/ci.yml`) runs typecheck, tests and `cdk synth` on every push — the synth step
+also proves the Sharp `linux-arm64` bundle builds on a clean machine.
 
-# 3. Wait for processing
-sleep 10
-
-# 4. Check status
-curl "$API_ENDPOINT/status?imageId=$IMAGE_ID" | jq
-```
-
-## DynamoDB Schema
-
-**Table Name**: `ImageProcessingTable`
-
-**Partition Key**: `imageId` (String)
-
-**Attributes**:
-- `imageId`: Unique identifier (UUID)
-- `originalKey`: S3 key of original image
-- `processedKey`: S3 key of processed image
-- `bucket`: Source bucket name
-- `size`: Original file size in bytes
-- `status`: Processing status (`pending`, `ok`, `error`)
-- `uploadedAt`: ISO timestamp of upload
-- `processedAt`: ISO timestamp of processing completion
-- `errorMessage`: Error message if status is `error`
-
-## Cleanup
-
-To remove all resources:
-
-```bash
-npm run destroy
-```
-
-## Project Structure
+## Project structure
 
 ```
-lambda-images/
-├── bin/
-│   └── app.ts                    # CDK app entry point
-├── lib/
-│   └── image-processing-stack.ts # CDK stack (all infrastructure)
+├── bin/app.ts                    CDK app entry
+├── lib/image-processing-stack.ts All infrastructure (one stack, ~200 lines)
 ├── lambdas/
-│   ├── get-upload-url.ts         # Lambda 1: Generate presigned URL
-│   ├── process-upload.ts         # Lambda 2: S3 event handler
-│   ├── resize-image.ts           # Lambda 3: Image processing (Sharp)
-│   └── get-status.ts             # Lambda 4: Status checker
-├── public/
-│   └── index.html                # Frontend web interface
-├── diagrams/
-│   └── architecture-mermaid.md   # Mermaid architecture diagrams
-├── scripts/
-│   └── test-pipeline.sh          # Testing script
-├── types/
-│   └── image-record.ts           # TypeScript types
-├── package.json
-├── tsconfig.json
-├── cdk.json
-├── DEPLOYMENT.md                 # Deployment guide
-├── CONTRIBUTING.md               # Contribution guidelines
-└── README.md                     # This file
+│   ├── get-upload-url.ts         POST /upload — validate, sign
+│   ├── process-upload.ts         S3 event → DynamoDB + SQS
+│   ├── resize-image.ts           SQS → Sharp → S3 + DynamoDB
+│   ├── get-status.ts             GET /status
+│   └── shared/http.ts            JSON / error response helpers
+├── types/image-record.ts         Shared contracts + limits
+├── test/                         vitest: handlers + CDK assertions
+├── public/index.html             Drag-and-drop demo UI (Tailwind, no build step)
+├── diagrams/                     Mermaid diagrams
+└── .github/workflows/ci.yml
 ```
 
-## Technology Stack
+## Operations
 
-- **Language**: TypeScript
-- **Infrastructure**: AWS CDK
-- **Runtime**: Node.js 20.x
-- **Image Processing**: Sharp library
-- **AWS Services**: Lambda, S3, SQS, DynamoDB
-
-## Cost Estimation
-
-This is a serverless application with pay-per-use pricing:
-
-- **Lambda**: Free tier includes 1M requests/month
-- **S3**: $0.023 per GB stored
-- **DynamoDB**: Free tier includes 25 GB storage
-- **SQS**: Free tier includes 1M requests/month
-
-Estimated cost for 1000 images/month: < $1
-
-## 🔧 Troubleshooting
-
-### Error: "No bucket named 'cdk-hnb659fds-assets'"
-
-**Cause**: CDK bootstrap bucket doesn't exist or you're using root user credentials.
-
-**Solution**:
 ```bash
-# 1. Make sure you're using IAM user (not root)
-aws sts get-caller-identity
-# Should show: "arn:aws:iam::ACCOUNT:user/cdk-deploy-user"
-
-# 2. Re-run bootstrap with proper execution policies
-export AWS_PROFILE=cdk
-cdk bootstrap aws://$(aws sts get-caller-identity --query Account --output text)/eu-north-1 \
-  --cloudformation-execution-policies arn:aws:iam::aws:policy/AdministratorAccess
-```
-
-### Error: "Role arn:aws:iam::ACCOUNT:role/cdk-hnb659fds-cfn-exec-role is invalid or cannot be assumed"
-
-**Cause**: CDK was bootstrapped without proper execution policies, so it cannot create/destroy resources.
-
-**Solution**: Re-bootstrap with correct policies:
-```bash
-export AWS_PROFILE=cdk
-cdk bootstrap aws://$(aws sts get-caller-identity --query Account --output text)/eu-north-1 \
-  --force \
-  --cloudformation-execution-policies arn:aws:iam::aws:policy/AdministratorAccess
-```
-
-### Error: "Stack is in UPDATE_ROLLBACK_FAILED state"
-
-**Cause**: Previous deployment failed and stack is in a bad state.
-
-**Solution**:
-```bash
-# Delete the failed stack
-aws cloudformation delete-stack --stack-name ImageProcessingStack
-
-# Wait for deletion to complete
-aws cloudformation wait stack-delete-complete --stack-name ImageProcessingStack
-
-# Deploy again
-npm run deploy
-```
-
-### Error: "User is not authorized to perform: sts:AssumeRole"
-
-**Cause**: IAM user doesn't have sufficient permissions.
-
-**Solution**:
-1. Go to AWS Console → IAM → Users → Your user
-2. Attach policy: `AdministratorAccess`
-3. Try deployment again
-
-### Lambda timeout errors
-
-**Cause**: Processing large images takes longer than the configured timeout.
-
-**Solution**: Increase timeout and memory in `lib/image-processing-stack.ts`:
-```typescript
-const lambda3 = new nodejs.NodejsFunction(stack, 'ResizeImageFunction', {
-  timeout: cdk.Duration.seconds(600),  // Increase from 300 to 600
-  memorySize: 2048,                    // Increase from 1024 to 2048
-  // ...
-});
-```
-
-### CORS errors in browser
-
-**Cause**: API endpoint not configured correctly in frontend.
-
-**Solution**:
-```bash
-# Get correct API endpoint
-aws cloudformation describe-stacks \
-  --stack-name ImageProcessingStack \
-  --query 'Stacks[0].Outputs[?OutputKey==`ApiEndpoint`].OutputValue' \
-  --output text
-
-# Update public/index.html line 10 with the correct endpoint
-```
-
-### Image processing fails silently
-
-**Cause**: Lambda function error not visible in frontend.
-
-**Solution**: Check CloudWatch logs:
-```bash
-# View ResizeImage Lambda logs
+# Follow the resize worker's logs
 aws logs tail /aws/lambda/ImageProcessing-ResizeImage --follow
 
-# View all Lambda logs
-aws logs tail /aws/lambda/ImageProcessing-ProcessUpload --follow
-```
-
-### "AccessDenied" errors in S3
-
-**Cause**: Lambda doesn't have permissions to access S3 buckets.
-
-**Solution**: This should be automatic via CDK. If it persists:
-```bash
-# Redeploy the stack
-npm run deploy
-```
-
-### After `npm run destroy`, next deploy fails
-
-**Cause**: CDK bootstrap resources were also deleted.
-
-**Solution**:
-```bash
-# Re-bootstrap CDK
-export AWS_PROFILE=cdk
-cdk bootstrap aws://$(aws sts get-caller-identity --query Account --output text)/eu-north-1
-
-# Deploy again
-npm run deploy
-```
-
-### DynamoDB "ResourceNotFoundException"
-
-**Cause**: Table doesn't exist or wrong table name.
-
-**Solution**:
-```bash
-# Check if table exists
-aws dynamodb describe-table --table-name ImageProcessingTable
-
-# If not exists, redeploy
-npm run deploy
-```
-
-### SQS messages not being processed
-
-**Cause**: Lambda3 not triggered by SQS.
-
-**Solution**: Check SQS queue depth:
-```bash
-# Get queue URL from outputs
-QUEUE_URL=$(aws cloudformation describe-stacks \
+# Anything in the dead-letter queue?
+aws sqs get-queue-attributes --queue-url "$(aws cloudformation describe-stacks \
   --stack-name ImageProcessingStack \
-  --query 'Stacks[0].Outputs[?OutputKey==`QueueUrl`].OutputValue' \
-  --output text)
-
-# Check messages in queue
-aws sqs get-queue-attributes \
-  --queue-url $QUEUE_URL \
+  --query 'Stacks[0].Outputs[?OutputKey==`DeadLetterQueueUrl`].OutputValue' --output text)" \
   --attribute-names ApproximateNumberOfMessages
 
-# If messages are stuck, check Lambda3 logs
-aws logs tail /aws/lambda/ImageProcessing-ResizeImage --follow
+# Preview infrastructure changes before deploying
+npm run diff
 ```
 
-### Need to change AWS region
+**Cost.** Everything is on-demand. At 1 000 images/month the bill rounds to zero: Lambda, SQS and
+DynamoDB stay inside the free tier; S3 storage is a few cents and self-cleans after 7 days.
 
-**Solution**:
-```bash
-# 1. Update AWS CLI profile
-aws configure --profile cdk
-# Enter new region (e.g., us-east-1)
+**Tear down.** `npm run destroy` removes every resource, including bucket contents and log groups
+(all removal policies are `DESTROY` — this is a demo, not a system of record).
 
-# 2. Bootstrap new region
-cdk bootstrap aws://$(aws sts get-caller-identity --query Account --output text)/us-east-1
+## Limitations and next steps
 
-# 3. Update bin/app.ts if you hardcoded region
-# 4. Deploy
-npm run deploy
-```
+Deliberately out of scope, but the natural next increments:
+
+- **Auth** — the API and CORS are wide open. Put an authorizer (Cognito / JWT) on the HTTP API and
+  restrict `allowOrigins` to the real frontend.
+- **Multiple sizes / formats** — `resize-image.ts` produces one 400×400 crop. A fan-out to several
+  variants would be a second queue or an SQS message per variant.
+- **Notifications** — clients poll `/status`. WebSocket API or EventBridge → SNS would push instead.
+- **Provisioned concurrency** — the Sharp function has a noticeable cold start; fine for a
+  queue consumer, worth tuning if the pipeline ever becomes latency-sensitive.
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).
