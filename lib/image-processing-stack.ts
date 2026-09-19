@@ -6,6 +6,9 @@ import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as sqs from 'aws-cdk-lib/aws-sqs';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
+import * as cloudwatchActions from 'aws-cdk-lib/aws-cloudwatch-actions';
+import * as sns from 'aws-cdk-lib/aws-sns';
+import * as snsSubscriptions from 'aws-cdk-lib/aws-sns-subscriptions';
 import * as lambdaEventSources from 'aws-cdk-lib/aws-lambda-event-sources';
 import * as apigatewayv2 from 'aws-cdk-lib/aws-apigatewayv2';
 import * as apigatewayv2Integrations from 'aws-cdk-lib/aws-apigatewayv2-integrations';
@@ -24,12 +27,24 @@ const LOG_RETENTION = logs.RetentionDays.TWO_WEEKS;
 const RUNTIME = lambda.Runtime.NODEJS_22_X;
 const ARCHITECTURE = lambda.Architecture.ARM_64;
 
+/**
+ * The AWS SDK v3 ships with the Node.js runtime, so it is left out of every bundle.
+ * Trade-off: smaller assets and faster cold starts, but the SDK version follows Lambda
+ * runtime updates rather than package.json. Set `bundleAwsSDK: true` instead to pin it.
+ */
+const EXTERNAL_MODULES = ['@aws-sdk/*'];
+
 /** Pin the Sharp build to the Lambda platform, whatever the host that runs `cdk synth`. */
 const SHARP_VERSION: string = require('../package.json').dependencies.sharp;
 const SHARP_PLATFORM = { os: 'linux', cpu: 'arm64', libc: 'glibc' } as const;
 
+export interface ImageProcessingStackProps extends cdk.StackProps {
+  /** Email address subscribed to the DLQ alarm topic. Omit to create the topic without subscribers. */
+  readonly alarmEmail?: string;
+}
+
 export class ImageProcessingStack extends cdk.Stack {
-  constructor(scope: Construct, id: string, props?: cdk.StackProps) {
+  constructor(scope: Construct, id: string, props: ImageProcessingStackProps = {}) {
     super(scope, id, props);
 
     // ---------------------------------------------------------------- Storage
@@ -88,7 +103,15 @@ export class ImageProcessingStack extends cdk.Stack {
       deadLetterQueue: { queue: deadLetterQueue, maxReceiveCount: MAX_RECEIVE_COUNT },
     });
 
-    new cloudwatch.Alarm(this, 'DeadLetterQueueAlarm', {
+    const alarmTopic = new sns.Topic(this, 'AlarmTopic', {
+      topicName: 'ImageProcessing-Alarms',
+      displayName: 'Image processing pipeline alarms',
+    });
+    if (props.alarmEmail) {
+      alarmTopic.addSubscription(new snsSubscriptions.EmailSubscription(props.alarmEmail));
+    }
+
+    const dlqAlarm = new cloudwatch.Alarm(this, 'DeadLetterQueueAlarm', {
       alarmName: 'ImageProcessing-DLQ-NotEmpty',
       alarmDescription: 'Messages have exhausted their retries and need manual attention',
       metric: deadLetterQueue.metricApproximateNumberOfMessagesVisible({ period: cdk.Duration.minutes(1) }),
@@ -97,6 +120,8 @@ export class ImageProcessingStack extends cdk.Stack {
       evaluationPeriods: 1,
       treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
     });
+    dlqAlarm.addAlarmAction(new cloudwatchActions.SnsAction(alarmTopic));
+    dlqAlarm.addOkAction(new cloudwatchActions.SnsAction(alarmTopic));
 
     // ---------------------------------------------------------------- Functions
 
@@ -124,7 +149,7 @@ export class ImageProcessingStack extends cdk.Stack {
       bundling: {
         // Sharp ships native binaries, so it cannot be bundled by esbuild. Install the
         // Lambda-platform build into the asset explicitly rather than the host's build.
-        externalModules: ['@aws-sdk/*', 'sharp'],
+        externalModules: [...EXTERNAL_MODULES, 'sharp'],
         commandHooks: {
           beforeBundling: () => [],
           beforeInstall: () => [],
@@ -193,6 +218,7 @@ export class ImageProcessingStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'TableName', { value: table.tableName, description: 'DynamoDB status table' });
     new cdk.CfnOutput(this, 'QueueUrl', { value: queue.queueUrl, description: 'SQS processing queue' });
     new cdk.CfnOutput(this, 'DeadLetterQueueUrl', { value: deadLetterQueue.queueUrl, description: 'SQS dead-letter queue' });
+    new cdk.CfnOutput(this, 'AlarmTopicArn', { value: alarmTopic.topicArn, description: 'SNS topic notified when the DLQ is not empty' });
   }
 
   /** Common wiring for every Lambda: runtime, architecture, log group with retention. */
@@ -221,6 +247,7 @@ export class ImageProcessingStack extends cdk.Stack {
       bundling: {
         minify: true,
         sourceMap: true,
+        externalModules: EXTERNAL_MODULES,
         ...props.bundling,
       },
       environment: {

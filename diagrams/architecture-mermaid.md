@@ -30,7 +30,7 @@ graph TB
     subgraph Queue
         SQS["SQS ImageProcessingQueue<br/>visibility 360 s · batch 1"]
         DLQ["SQS ImageProcessingDLQ<br/>after 3 failed receives"]
-        Alarm["CloudWatch alarm<br/>DLQ not empty"]
+        Alarm["CloudWatch alarm → SNS<br/>DLQ not empty"]
     end
 
     Client -->|1. contentType + size| Upload --> L1

@@ -22,7 +22,20 @@ describe('ImageProcessingStack', () => {
       RedrivePolicy: { maxReceiveCount: 3, deadLetterTargetArn: Match.anyValue() },
     });
     template.hasResourceProperties('AWS::SQS::Queue', { QueueName: 'ImageProcessingDLQ' });
-    template.hasResourceProperties('AWS::CloudWatch::Alarm', { AlarmName: 'ImageProcessing-DLQ-NotEmpty' });
+    template.hasResourceProperties('AWS::CloudWatch::Alarm', {
+      AlarmName: 'ImageProcessing-DLQ-NotEmpty',
+      AlarmActions: [{ Ref: Match.stringLikeRegexp('^AlarmTopic') }],
+    });
+  });
+
+  it('subscribes the alarm email when one is provided', () => {
+    const app = new cdk.App({ context: { 'aws:cdk:bundling-stacks': [] } });
+    const stack = new ImageProcessingStack(app, 'WithEmail', { alarmEmail: 'ops@example.com' });
+    Template.fromStack(stack).hasResourceProperties('AWS::SNS::Subscription', {
+      Protocol: 'email',
+      Endpoint: 'ops@example.com',
+    });
+    template.resourceCountIs('AWS::SNS::Subscription', 0); // default stack: topic only
   });
 
   it('keeps the queue visibility timeout at 6× the consumer timeout', () => {

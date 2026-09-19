@@ -42,7 +42,7 @@ graph TB
     subgraph Queue
         SQS["SQS ImageProcessingQueue<br/>visibility 360 s · batch 1"]
         DLQ["SQS ImageProcessingDLQ<br/>after 3 failed receives"]
-        Alarm["CloudWatch alarm<br/>DLQ not empty"]
+        Alarm["CloudWatch alarm → SNS<br/>DLQ not empty"]
     end
 
     Client -->|1. contentType + size| Upload --> L1
@@ -81,7 +81,7 @@ Sequence, state and IAM diagrams: [diagrams/architecture-mermaid.md](diagrams/ar
 
 | Concern | What the stack does | Why |
 | --- | --- | --- |
-| **Poison messages** | Main queue redrives to a DLQ after 3 receives; a CloudWatch alarm fires when the DLQ is non-empty. | Without a DLQ a bad message is retried for the whole 4-day retention period — every attempt downloads from S3, spins up Sharp and writes to DynamoDB. |
+| **Poison messages** | Main queue redrives to a DLQ after 3 receives; a CloudWatch alarm publishes to an SNS topic when the DLQ is non-empty (`-c alarmEmail=you@example.com` subscribes an address). | Without a DLQ a bad message is retried for the whole 4-day retention period — every attempt downloads from S3, spins up Sharp and writes to DynamoDB. |
 | **Permanent vs transient failures** | A corrupt or unsupported image is recorded as `error` and *acknowledged*. S3/DynamoDB failures are recorded and *rethrown*. | Retrying a broken file cannot help; retrying a throttled DynamoDB call can. The DLQ only ever contains things worth a human's attention. |
 | **Visibility timeout** | `6 × function timeout` (60 s → 360 s), derived from one constant. | AWS's recommendation for Lambda consumers. Equal values let a message become visible while the previous invocation is still finishing, causing duplicate processing. |
 | **Data retention** | DynamoDB TTL on `expiresAt` + S3 lifecycle rules on both buckets, all 7 days. | Records and objects age out together; nothing accumulates silently. |
@@ -90,6 +90,7 @@ Sequence, state and IAM diagrams: [diagrams/architecture-mermaid.md](diagrams/ar
 | **Least privilege** | Each function is granted exactly the actions and key prefixes it uses (`uploads/*`, `processed/*`). | Blast radius of a compromised function stays small. |
 | **Error responses** | Clients get `{ "error": "Failed to get image status" }`; the stack trace goes to CloudWatch. | Internal ARNs, table names and SDK messages are not a client's business. |
 | **Log retention** | Explicit log group per function, 14 days. | Default Lambda log groups never expire. |
+| **AWS SDK** | Excluded from every bundle (`externalModules: ['@aws-sdk/*']`); the runtime's copy is used. | Smaller assets, faster cold starts. The SDK version then follows Lambda runtime updates rather than `package.json` — acceptable here; `bundleAwsSDK: true` pins it if that ever matters. |
 | **Sharp on Lambda** | Bundling hook installs the `linux-arm64` build explicitly and fails loudly if it is missing. | `esbuild` cannot bundle native binaries; the naïve approach silently ships the host OS's build and crashes at runtime. |
 | **Shared contracts** | `types/image-record.ts` defines the DynamoDB item, the SQS payload and both HTTP responses; every handler imports them. | One definition, one place to change it, and the compiler catches drift. |
 
@@ -104,7 +105,7 @@ npm ci
 
 npm run typecheck && npm test         # no AWS access needed
 npx cdk bootstrap                     # once per account/region
-npm run deploy                        # ~2 minutes
+npm run deploy -- -c alarmEmail=you@example.com   # ~2 minutes; email is optional
 ```
 
 Deployment prints the API endpoint:
@@ -202,7 +203,7 @@ Response `200`:
 npm test
 ```
 
-35 tests in five files, no AWS access required:
+36 tests in five files, no AWS access required:
 
 - **Handlers** — every Lambda runs against `aws-sdk-client-mock`. Sharp is *not* mocked: the resize
   test generates a real 800×600 JPEG and asserts the output decodes to 400×400. There are cases for

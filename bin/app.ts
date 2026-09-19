@@ -10,4 +10,6 @@ new ImageProcessingStack(app, 'ImageProcessingStack', {
     region: process.env.CDK_DEFAULT_REGION,
   },
   description: 'Serverless image processing pipeline: S3 → Lambda → SQS → Sharp → DynamoDB',
+  // cdk deploy -c alarmEmail=you@example.com  (or ALARM_EMAIL=…)
+  alarmEmail: app.node.tryGetContext('alarmEmail') ?? process.env.ALARM_EMAIL,
 });
